@@ -1,4 +1,4 @@
-core_etfs
-SWDA LN Equity
-CBE3 LN Equity
-ICOV LN Equity
+core_etfs,theme
+DJSC LN Equity,Equity
+CBE3 LN Equity,Rates
+IEAC LN Equity,Credit
