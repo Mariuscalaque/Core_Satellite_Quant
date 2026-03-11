@@ -317,19 +317,28 @@ def main() -> None:
 
     # ── Max Sharpe Rolling ────────────────────────────────────────────────────
     print("\n[4] Backtest rolling Max Sharpe (252j lookback, 63j rebal)...")
+    roll_ret_is = _backtest_rolling(
+        df, cfg.w_min, cfg.w_max,
+        cfg.rolling_lookback, cfg.rolling_rebal,
+        cfg.calib_start, cfg.calib_end,
+    )
     roll_ret = _backtest_rolling(
         df, cfg.w_min, cfg.w_max,
         cfg.rolling_lookback, cfg.rolling_rebal,
         cfg.oos_start, cfg.oos_end,
     )
+    m_roll_is = _perf_metrics(roll_ret_is)
     m_roll = _perf_metrics(roll_ret)
     strategies["Max Sharpe Rolling"] = {
+        "ret_is":      m_roll_is["ret_ann"],
+        "vol_is":      m_roll_is["vol_ann"],
+        "sharpe_is":   m_roll_is["sharpe"],
         "oos_ret":    roll_ret,
         "oos_ret_ann": m_roll["ret_ann"], "oos_vol": m_roll["vol_ann"],
         "oos_sharpe":  m_roll["sharpe"],  "oos_mdd": m_roll["mdd"],
     }
     print(f"  {'Max Sharpe Rolling':<22s}  (rolling)  "
-          f"OOS Sharpe={m_roll['sharpe']:.2f}")
+          f"IS Sharpe={m_roll_is['sharpe']:.2f}  OOS Sharpe={m_roll['sharpe']:.2f}")
 
     # ── Tableau comparatif ────────────────────────────────────────────────────
     print("\n" + "=" * 60)

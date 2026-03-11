@@ -73,6 +73,8 @@ class BlocConfig:
     expense_max_by_strategy: Dict[str, float] = field(default_factory=dict)
 
     # ── Niveau 1 : Volatilité (annualisée, calculée sur calib window) ────
+    vol_min_default: float = 0.0
+    vol_min_by_strategy: Dict[str, float] = field(default_factory=dict)
     vol_max_default: float = 0.30
     vol_max_by_strategy: Dict[str, float] = field(default_factory=dict)
 
@@ -120,6 +122,10 @@ class SatelliteConfig:
     beta_filter_max_abs: float = 0.25
     beta_filter_min_pass_ratio: float = 0.70
 
+    # ── Qualité de cotation (stale pricing) ─────────────────────────────
+    # Exclut les fonds trop souvent inchangés en business days sur calib.
+    stale_max_ratio: float = 0.35
+
     # ── Sorties ───────────────────────────────────────────────────────────
     output_selected_csv: str = ""
 
@@ -148,7 +154,9 @@ def _build_default_blocs(project_root: Path) -> Dict[str, BlocConfig]:
             info_path=str(project_root / "data" / "STRAT1_info.xlsx"),
             price_path=str(project_root / "data" / "STRAT1_price.xlsx"),
             expense_max_default=2.0,
+            vol_min_default=0.0,
             vol_max_default=0.20,
+            vol_min_by_strategy={},
             vol_max_by_strategy={},
             sharpe_min=-0.5,
             alpha_min_annual=-0.10,
@@ -164,7 +172,9 @@ def _build_default_blocs(project_root: Path) -> Dict[str, BlocConfig]:
             info_path=str(project_root / "data" / "STRAT2_info.xlsx"),
             price_path=str(project_root / "data" / "STRAT2_price.xlsx"),
             expense_max_default=2.0,
+            vol_min_default=0.10,
             vol_max_default=0.10,
+            vol_min_by_strategy={},
             vol_max_by_strategy={
                 "Neutre au marché":            0.08,
                 "CTA/futures gérés":           0.18,
@@ -191,7 +201,9 @@ def _build_default_blocs(project_root: Path) -> Dict[str, BlocConfig]:
                 "Titres adossés à des actifs": 1.8,
                 "Prêts bancaires":             1.8,
             },
+            vol_min_default=0.10,
             vol_max_default=0.45,
+            vol_min_by_strategy={},
             vol_max_by_strategy={
                 "Energie":                         0.45,
                 "Métaux industriels":              0.30,
@@ -426,11 +438,20 @@ def calculer_metriques_calib(
     rets_calib = log_rets.loc[calib_start:calib_end]
     core_calib = core_rets.loc[calib_start:calib_end]
 
+    bday_idx = pd.date_range(calib_start, calib_end, freq="B")
+
     rows = []
     for ticker in rets_calib.columns:
         s = rets_calib[ticker].dropna()
         if len(s) < 30:
             continue
+
+        # Proxy de stale pricing : part de jours ouvrés sans variation de prix
+        # après forward-fill sur la fenêtre de calibration.
+        p = wide_prices[ticker].loc[calib_start:calib_end].reindex(bday_idx).ffill()
+        stale_mask = (p.diff().abs() <= 1e-12) & p.notna() & p.shift(1).notna()
+        stale_ratio = float(stale_mask.mean()) if len(stale_mask) else np.nan
+
         alpha, beta = _ols_alpha_beta(s, core_calib)
         rows.append(dict(
             ticker=ticker,
@@ -442,6 +463,7 @@ def calculer_metriques_calib(
             skew_calib=float(stats.skew(s)),
             kurtosis_calib=float(stats.kurtosis(s)),   # excess kurtosis
             n_obs_calib=len(s),
+            stale_ratio_calib=stale_ratio,
         ))
 
     return pd.DataFrame(rows).set_index("ticker")
@@ -557,11 +579,14 @@ def filtrer_niveau1(
     info: pd.DataFrame,
     metrics: pd.DataFrame,
     bloc_cfg: BlocConfig,
+    cfg: SatelliteConfig,
 ) -> List[str]:
     """
-    Niveau 1 – Frais & Volatilité (réalisée sur calib window) :
+        Niveau 1 – Frais, Volatilité & Qualité de cotation (calib window) :
       - Expense ratio ≤ seuil (par stratégie ou défaut bloc)
+            - Volatilité annualisée ≥ seuil minimum (par stratégie ou défaut bloc)
       - Volatilité annualisée ≤ seuil (par stratégie ou défaut bloc)
+            - Part de jours stale ≤ cfg.stale_max_ratio
     """
     valid = []
     for ticker in tickers:
@@ -575,9 +600,16 @@ def filtrer_niveau1(
 
         if ticker not in metrics.index:
             continue
-        vol_max = bloc_cfg.vol_max_by_strategy.get(strat, bloc_cfg.vol_max_default)
         vol = metrics.at[ticker, "vol_calib"]
+        vol_min = bloc_cfg.vol_min_by_strategy.get(strat, bloc_cfg.vol_min_default)
+        vol_max = bloc_cfg.vol_max_by_strategy.get(strat, bloc_cfg.vol_max_default)
+        if not np.isnan(vol) and vol < vol_min:
+            continue
         if not np.isnan(vol) and vol > vol_max:
+            continue
+
+        stale = metrics.at[ticker, "stale_ratio_calib"] if "stale_ratio_calib" in metrics.columns else np.nan
+        if not np.isnan(stale) and stale > cfg.stale_max_ratio:
             continue
 
         valid.append(ticker)
@@ -751,8 +783,12 @@ def traiter_bloc(
     t0 = filtrer_niveau0(info, prices, cfg)
     print(f"  [Niv.0] AUM/Date/Devise/Excl.  {len(t0):3d} / {len(common)}")
 
-    t1 = filtrer_niveau1(t0, info, metrics, bloc_cfg)
-    print(f"  [Niv.1] Frais & Volatilité     {len(t1):3d} / {len(t0)}")
+    t1 = filtrer_niveau1(t0, info, metrics, bloc_cfg, cfg)
+    print(
+        f"  [Niv.1] Frais/Vol[{bloc_cfg.vol_min_default:.0%},{bloc_cfg.vol_max_default:.0%}]"
+        f"/Stale<= {cfg.stale_max_ratio:.0%} "
+        f"{len(t1):3d} / {len(t0)}"
+    )
 
     t2 = filtrer_niveau2(t1, metrics, bloc_cfg)
     print(f"  [Niv.2] Sharpe/Alpha/Drawdown  {len(t2):3d} / {len(t1)}")
@@ -783,8 +819,8 @@ def traiter_bloc(
     return selected, metrics, info, beta_roll
 
 
-def main() -> None:
-    cfg = SatelliteConfig()
+def main(cfg: SatelliteConfig | None = None) -> None:
+    cfg = cfg or SatelliteConfig()
 
     print("=" * 60)
     print("  PIPELINE SATELLITE v2 – Filtrage & Sélection")
@@ -826,7 +862,8 @@ def main() -> None:
                     row[col] = info.at[ticker, col] if col in info.columns else np.nan
             if ticker in metrics.index:
                 for col in ["vol_calib", "sharpe_calib", "alpha_annual", "beta_core",
-                            "drawdown_calib", "skew_calib", "kurtosis_calib", "n_obs_calib"]:
+                        "drawdown_calib", "skew_calib", "kurtosis_calib",
+                        "n_obs_calib", "stale_ratio_calib"]:
                     row[col] = metrics.at[ticker, col] if col in metrics.columns else np.nan
             rows.append(row)
 
