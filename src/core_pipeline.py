@@ -1,22 +1,22 @@
 """
-Pipeline Core – v3 (hybride)
+Pipeline Core – v4 (Excel unifié)
 
 Sources de données :
-  - Equity   : 'ETF EUR Bloomberg Cross Asset.xlsx'
-      * Worksheet  : metadata (Ticker, Expense Ratio)
-      * Feuil3     : prix daily
-  - Rates & Credit : 'core_ETF_old.xlsx'
-      * Buckets d'origine : Rates EMU Govies, Credit EMU IG, EMU Aggregate
+  - 'ETF EUR Bloomberg Cross Asset.xlsx'
+      * EQUITY : prix daily (paires date/prix)
+      * RATES  : prix daily (paires date/prix)
+      * CREDIT : prix daily (paires date/prix)
+      * Worksheet (optionnel) : metadata TER
 
 Pipeline :
-  1) Lecture prix Equity (nouveau fichier) + filtrage (date, fréquence, frais)
-  2) Lecture prix Rates/Credit (ancien fichier) + mapping buckets
+  1) Lecture prix Equity/Rates/Credit depuis le même fichier
+  2) Filtrage structurel (date de démarrage, fréquence ; frais si metadata dispo)
   3) Sélection 1 ETF « best » par thème :
-       - Equity  : pick_best parmi les ETFs filtrés du nouveau fichier
-       - Rates   : pick_best parmi les Rates de l'ancien fichier
-       - Credit  : pick_best parmi les Credit de l'ancien fichier
+       - Equity  : pick_best parmi EQUITY
+       - Rates   : pick_best parmi RATES
+       - Credit  : pick_best parmi CREDIT
   4) Backtest rolling OOS trimestriel (Max Sharpe, poids ∈ [5%, 50%])
-  5) Export rendements mensuels du Core (3 ETFs)
+  5) Export rendements journaliers du Core (3 ETFs sélectionnés)
 """
 
 from __future__ import annotations
@@ -35,13 +35,14 @@ class CoreConfig:
     """Paramètres du pipeline Core."""
     project_root: Path = Path(__file__).resolve().parent.parent
 
-    # ── Nouveau fichier (Equity) ──────────────────
-    equity_excel: str = str(project_root / "data" / "ETF EUR Bloomberg Cross Asset.xlsx")
+    # ── Fichier Excel unifié ───────────────────────
+    core_excel: str = str(project_root / "data" / "ETF EUR Bloomberg Cross Asset.xlsx")
+    sheet_equity: str = "EQUITY"
+    sheet_rates: str = "RATES"
+    sheet_credit: str = "CREDIT"
+    # Metadata TER optionnel
     sheet_meta: str = "Worksheet"
-    sheet_prices: str = "Feuil3"
-
-    # ── Ancien fichier (Rates / Credit) ───────────
-    old_excel: str = str(project_root / "data" / "core_ETF_old.xlsx")
+    require_expense_info: bool = False
 
     # ── Filtres Equity ────────────────────────────
     max_start_date: str = "2019-01-01"
@@ -80,8 +81,17 @@ def _parse_dates_any(x: pd.Series) -> pd.Series:
     dt = pd.to_datetime(x, errors="coerce", dayfirst=True)
     if dt.notna().sum() < max(5, int(0.20 * len(x))):
         num = pd.to_numeric(x, errors="coerce")
-        dt2 = pd.to_datetime(num, errors="coerce", unit="D", origin="1899-12-30")
+        mask_valid = num.notna() & (num >= 1) & (num <= 80_000)
+        dt2 = pd.Series(pd.NaT, index=x.index)
+        if mask_valid.any():
+            dt2.loc[mask_valid] = pd.to_datetime(
+                num.loc[mask_valid].astype(int),
+                errors="coerce", unit="D", origin="1899-12-30"
+            )
         dt = dt.fillna(dt2)
+    # Évite les dates aberrantes (ex: 1970) dues aux cellules mal parsées.
+    year = dt.dt.year
+    dt = dt.where(year.between(1990, 2100))
     return dt
 
 
@@ -140,21 +150,28 @@ def lire_equity(cfg: CoreConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
     applique les filtres (date, fréquence, expense ratio).
     Retourne (wide_filtré, summary).
     """
-    print("[1/7] Lecture Equity (nouveau fichier)...")
-    wide, _ = _lire_wide_paires(cfg.equity_excel, cfg.sheet_prices)
+    print("[1/7] Lecture Equity (fichier unifié)...")
+    wide, _ = _lire_wide_paires(cfg.core_excel, cfg.sheet_equity)
     print(f"  -> {wide.shape[1]} ETFs uniques | {wide.index.min().date()} à {wide.index.max().date()}")
 
-    # Metadata
-    df_meta = pd.read_excel(cfg.equity_excel, sheet_name=cfg.sheet_meta)
-    df_meta["expense_ratio_pct"] = (
-        df_meta["Expense Ratio"]
-        .astype(str)
-        .str.replace("%", "", regex=False)
-        .str.replace(",", ".", regex=False)
-        .pipe(pd.to_numeric, errors="coerce")
-    )
-    df_meta["ticker_full"] = df_meta["Ticker"].astype(str).str.strip() + " Equity"
-    expense_map = dict(zip(df_meta["ticker_full"], df_meta["expense_ratio_pct"]))
+    # Metadata TER (optionnel)
+    expense_map: Dict[str, float] = {}
+    try:
+        xls = pd.ExcelFile(cfg.core_excel)
+        if cfg.sheet_meta in xls.sheet_names:
+            df_meta = pd.read_excel(xls, sheet_name=cfg.sheet_meta)
+            if {"Ticker", "Expense Ratio"}.issubset(set(df_meta.columns)):
+                df_meta["expense_ratio_pct"] = (
+                    df_meta["Expense Ratio"]
+                    .astype(str)
+                    .str.replace("%", "", regex=False)
+                    .str.replace(",", ".", regex=False)
+                    .pipe(pd.to_numeric, errors="coerce")
+                )
+                df_meta["ticker_full"] = df_meta["Ticker"].astype(str).str.strip() + " Equity"
+                expense_map = dict(zip(df_meta["ticker_full"], df_meta["expense_ratio_pct"]))
+    except Exception as exc:
+        print(f"  ⚠  Metadata TER indisponible ({exc}). Filtre frais assoupli.")
 
     # Filtrage
     max_date = pd.Timestamp(cfg.max_start_date)
@@ -176,7 +193,10 @@ def lire_equity(cfg: CoreConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         pass_date = first_date <= max_date
         pass_freq = avg_gap <= cfg.max_avg_gap_days
-        pass_expense = (not np.isnan(expense)) and (expense <= max_expense)
+        if cfg.require_expense_info:
+            pass_expense = (not np.isnan(expense)) and (expense <= max_expense)
+        else:
+            pass_expense = np.isnan(expense) or (expense <= max_expense)
         selected = pass_date and pass_freq and pass_expense
 
         rows.append(dict(
@@ -201,62 +221,44 @@ def lire_equity(cfg: CoreConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 def lire_rates_credit(cfg: CoreConfig) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """
-    Lit les ETFs Rates & Credit depuis l'ancien fichier,
+    Lit les ETFs Rates & Credit depuis le fichier Excel unifié,
     reconstruit le mapping ticker → bucket.
     """
-    print("[3/7] Lecture Rates / Credit (ancien fichier)...")
-    meta = pd.read_excel(cfg.old_excel, header=None, nrows=3)
-    tickers_raw = [str(x).strip() if not pd.isna(x) else "" for x in meta.iloc[0, :].tolist()]
-    buckets_raw = [str(x).strip() if not pd.isna(x) else "" for x in meta.iloc[1, :].tolist()]
+    print("[3/7] Lecture Rates / Credit (fichier unifié)...")
+    wide_rates, _ = _lire_wide_paires(cfg.core_excel, cfg.sheet_rates)
+    wide_credit, _ = _lire_wide_paires(cfg.core_excel, cfg.sheet_credit)
 
-    # Identifier les colonnes Rates / Credit
-    rc_themes = {"Rates", "Credit", "Aggregate"}
-    rc_cols: List[int] = []
-    for j in range(0, len(tickers_raw), 2):
-        b = buckets_raw[j + 1] if j + 1 < len(buckets_raw) else ""
-        if any(k in b for k in rc_themes):
-            rc_cols.append(j)
-
-    # Lecture brute
-    df = pd.read_excel(cfg.old_excel, header=None, skiprows=3)
-    series_dict: Dict[str, pd.Series] = {}
-    ticker_to_bucket: Dict[str, str] = {}
-    seen: set = set()
-
-    for j in rc_cols:
-        price_col = j + 1
-        if price_col >= df.shape[1]:
+    # Filtrage structurel commun (date/frequence)
+    max_date = pd.Timestamp(cfg.max_start_date)
+    kept_rates: List[str] = []
+    for t in wide_rates.columns:
+        s = wide_rates[t].dropna()
+        if len(s) < 10:
             continue
-        tkr = tickers_raw[price_col] if price_col < len(tickers_raw) else ""
-        if not tkr or tkr in seen:
+        avg_gap = s.index.to_series().diff().dropna().dt.days.mean()
+        if s.index.min() <= max_date and avg_gap <= cfg.max_avg_gap_days:
+            kept_rates.append(t)
+
+    kept_credit: List[str] = []
+    for t in wide_credit.columns:
+        s = wide_credit[t].dropna()
+        if len(s) < 10:
             continue
-        seen.add(tkr)
+        avg_gap = s.index.to_series().diff().dropna().dt.days.mean()
+        if s.index.min() <= max_date and avg_gap <= cfg.max_avg_gap_days:
+            kept_credit.append(t)
 
-        bkt = buckets_raw[price_col] if price_col < len(buckets_raw) else ""
-
-        raw_dates = df.iloc[:, j]
-        num = pd.to_numeric(raw_dates, errors="coerce")
-        mask_excel = num.between(20000, 60000)
-        dates = raw_dates.astype(object).copy()
-        dates.loc[mask_excel] = pd.to_datetime(num[mask_excel], unit="D", origin="1899-12-30")
-        dates.loc[~mask_excel] = pd.to_datetime(raw_dates[~mask_excel], errors="coerce", dayfirst=True)
-        dates = pd.to_datetime(dates, errors="coerce")
-
-        prices = pd.to_numeric(df.iloc[:, price_col], errors="coerce")
-        valid = dates.notna() & prices.notna()
-        if valid.sum() == 0:
-            continue
-
-        s = pd.Series(prices[valid].values,
-                      index=pd.DatetimeIndex(dates[valid].values),
-                      name=tkr)
-        s = s.sort_index()
-        s = s[~s.index.duplicated(keep="first")]
-        series_dict[tkr] = s
-        ticker_to_bucket[tkr] = bkt
-
-    wide = pd.DataFrame(series_dict).sort_index().ffill()
+    wide = pd.concat([wide_rates[kept_rates], wide_credit[kept_credit]], axis=1)
+    wide = wide.loc[:, ~wide.columns.duplicated(keep="first")]
+    wide = wide.sort_index().ffill()
     wide.index.name = "Date"
+
+    # Mapping thème pour la sélection pick_best
+    ticker_to_bucket: Dict[str, str] = {}
+    for t in kept_rates:
+        ticker_to_bucket[t] = "Rates EMU Govies (Core)"
+    for t in kept_credit:
+        ticker_to_bucket[t] = "Credit EMU IG (Core)"
 
     print(f"  -> {wide.shape[1]} ETFs Rates/Credit | {wide.index.min().date()} à {wide.index.max().date()}")
     for t in wide.columns:
@@ -427,7 +429,7 @@ def main() -> None:
     # 1-2) Equity : lecture + filtrage
     wide_eq, summary_eq = lire_equity(cfg)
 
-    # 3) Rates / Credit : lecture depuis l'ancien fichier
+    # 3) Rates / Credit : lecture depuis le fichier unifié
     wide_rc, ticker_to_bucket = lire_rates_credit(cfg)
 
     # 4) Sélection 1 ETF par thème (scoring sur 2019-2020 uniquement : pas de look-ahead)
