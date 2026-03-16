@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
+import os
+import unicodedata
 
 import numpy as np
 import pandas as pd
@@ -111,7 +113,11 @@ class SatelliteConfig:
     # ── Niveau 0 – Filtres universels ────────────────────────────────────
     aum_min_m: float = 100.0
     max_start_date: str = "2019-01-01"
-    allowed_currencies: List[str] = field(default_factory=list)
+    # Filtre devise paramétrable.
+    # Par défaut: EUR uniquement, cohérent avec la contrainte de soutenance.
+    # Override possible via variable d'environnement:
+    #   SAT_ALLOWED_CURRENCIES="Euro,Dollar US"
+    allowed_currencies: List[str] = field(default_factory=lambda: ["Euro"])
     excluded_strategies: List[str] = field(default_factory=list)
 
     # ── Rolling beta window ───────────────────────────────────────────────
@@ -515,6 +521,9 @@ def filtrer_niveau0(
     """
     valid = []
     max_date = pd.Timestamp(cfg.max_start_date)
+    allowed_norm = {
+        _normalize_text(c) for c in cfg.allowed_currencies if str(c).strip()
+    }
 
     for ticker in wide_prices.columns:
         if ticker not in info.index:
@@ -530,9 +539,9 @@ def filtrer_niveau0(
         if len(prices) == 0 or prices.index.min() > max_date:
             continue
 
-        if cfg.allowed_currencies:
+        if allowed_norm:
             devise = str(row.get("devise", "")).strip()
-            if devise not in cfg.allowed_currencies:
+            if _normalize_text(devise) not in allowed_norm:
                 continue
 
         if cfg.excluded_strategies:
@@ -547,6 +556,13 @@ def filtrer_niveau0(
 
         valid.append(ticker)
     return valid
+
+
+def _normalize_text(s: str) -> str:
+    """Normalise une étiquette texte pour comparaisons robustes."""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.strip().lower()
 
 
 def filtrer_niveau_beta_initial(
@@ -822,9 +838,17 @@ def traiter_bloc(
 def main(cfg: SatelliteConfig | None = None) -> None:
     cfg = cfg or SatelliteConfig()
 
+    env_allowed = os.getenv("SAT_ALLOWED_CURRENCIES", "").strip()
+    if env_allowed:
+        cfg.allowed_currencies = [c.strip() for c in env_allowed.split(",") if c.strip()]
+
     print("=" * 60)
     print("  PIPELINE SATELLITE v2 – Filtrage & Sélection")
     print(f"  Fenêtre calib : {cfg.calib_start} → {cfg.calib_end}")
+    if cfg.allowed_currencies:
+        print(f"  Filtre devise : {cfg.allowed_currencies}")
+    else:
+        print("  Filtre devise : désactivé")
     print("=" * 60)
 
     print("\n[1] Chargement des rendements Core...")

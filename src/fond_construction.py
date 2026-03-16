@@ -50,6 +50,7 @@ class FondConfig:
     vol_target_min: float = 0.08
     vol_target_max: float = 0.12
     vol_target_mid: float = 0.10
+    strict_vol_target: bool = False
 
     # ── Pas de levier ─────────────────────────────────────────────────────────
     # Exposition brute = 100 % (w_core + w_sat = 1.0), aucun scaling.
@@ -57,8 +58,9 @@ class FondConfig:
 
     # ── Frais (bps/an) ────────────────────────────────────────────────────────
     fees_bps_max:         float = 80.0
-    fees_core_bps:        float = 23.0    # ≈ égal-pondéré DJSC(35)+CBE3(15)+IEAC(20)
+    fees_core_bps:        float = 23.0
     fees_sat_default_bps: float = 200.0   # défaut conservateur pour fees non renseignées
+    fees_core_fallback_bps_per_etf: float = 25.0
 
     # ── Beta max poche satellite vs Core ──────────────────────────────────────
     beta_sat_max: float = 0.25
@@ -75,6 +77,9 @@ class FondConfig:
 
     # ── Fichiers d'entrée ────────────────────────────────────────────────────
     core_daily_csv:       str = str(project_root / "outputs" / "core_returns_daily_oos.csv")
+    core_selected_csv:    str = str(project_root / "outputs" / "core_selected_etfs.csv")
+    equity_meta_excel:    str = str(project_root / "data" / "ETF EUR Bloomberg Cross Asset.xlsx")
+    equity_meta_sheet:    str = "Worksheet"
     satellite_selected_csv: str = str(project_root / "outputs" / "satellite_selected.csv")
     price_paths: List[str] = field(default_factory=lambda: [
         str(project_root / "data" / "STRAT1_price.xlsx"),
@@ -114,7 +119,7 @@ def charger_prix_satellite(tickers: List[str], cfg: FondConfig) -> pd.DataFrame:
     if not frames:
         raise ValueError("Aucun ticker satellite trouvé dans les fichiers de prix.")
 
-    prices = pd.concat(frames, axis=1).sort_index()
+    prices = pd.concat(frames, axis=1, sort=False).sort_index()
     prices = prices.loc[:, ~prices.columns.duplicated(keep="first")]
 
     missing = [t for t in tickers if t not in prices.columns]
@@ -123,6 +128,77 @@ def charger_prix_satellite(tickers: List[str], cfg: FondConfig) -> pd.DataFrame:
 
     found = [t for t in tickers if t in prices.columns]
     return prices[found]
+
+
+def estimer_frais_core_bps(cfg: FondConfig) -> float:
+    """
+    Estime les frais Core (bps/an) à partir des ETF sélectionnés.
+    Fallback robuste si metadata incomplet.
+    """
+    try:
+        sel = pd.read_csv(cfg.core_selected_csv)
+        ticker_col = "core_etfs" if "core_etfs" in sel.columns else sel.columns[0]
+        tickers = sel[ticker_col].astype(str).str.strip().dropna().tolist()
+        if not tickers:
+            return cfg.fees_core_bps
+
+        meta = pd.read_excel(cfg.equity_meta_excel, sheet_name=cfg.equity_meta_sheet)
+        meta["ticker_full"] = meta["Ticker"].astype(str).str.strip() + " Equity"
+        meta["expense_pct"] = (
+            meta["Expense Ratio"]
+            .astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", ".", regex=False)
+            .pipe(pd.to_numeric, errors="coerce")
+        )
+        exp_map = dict(zip(meta["ticker_full"], meta["expense_pct"]))
+
+        fees_bps = []
+        missing = 0
+        for t in tickers:
+            exp_pct = exp_map.get(t, np.nan)
+            if pd.isna(exp_pct):
+                missing += 1
+                fees_bps.append(cfg.fees_core_fallback_bps_per_etf)
+            else:
+                fees_bps.append(float(exp_pct) * 100.0)  # % -> bps
+
+        est = float(np.mean(fees_bps))
+        if missing:
+            print(
+                f"  ⚠  Frais Core: {missing}/{len(tickers)} ETF sans TER metadata, "
+                f"fallback {cfg.fees_core_fallback_bps_per_etf:.0f} bps."
+            )
+        print(f"  Frais Core estimés (data-driven): {est:.1f} bps/an")
+        return est
+    except Exception as exc:
+        print(f"  ⚠  Estimation frais Core impossible ({exc}); fallback {cfg.fees_core_bps:.1f} bps.")
+        return cfg.fees_core_bps
+
+
+def agreger_ret_satellite(
+    sat_rets: pd.DataFrame,
+    sat_weights: pd.Series,
+) -> pd.Series:
+    """
+    Agrège les rendements des fonds satellite sans forcer NaN->0 globalement.
+    - À chaque date, les poids sont renormalisés sur les fonds disponibles.
+    - Si aucun fonds n'est disponible, retourne NaN pour cette date.
+    """
+    weights = sat_weights.reindex(sat_rets.columns).fillna(0.0).values
+    out = np.full(len(sat_rets), np.nan, dtype=float)
+
+    for i, row in enumerate(sat_rets.values):
+        valid = np.isfinite(row)
+        if not valid.any():
+            continue
+        wv = weights[valid]
+        sw = wv.sum()
+        if sw <= 1e-12:
+            continue
+        out[i] = float((wv / sw) @ row[valid])
+
+    return pd.Series(out, index=sat_rets.index, name="sat_pocket")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -142,8 +218,9 @@ def poids_satellite_equal_weight(
     de calibration sont retenus. On vérifie que chaque bloc est représenté.
     """
     combined = pd.concat(
-        [core_rets_calib.rename("core"), sat_rets_calib], axis=1
-    ).loc[cfg.calib_start:cfg.calib_end].dropna(subset=["core"])
+        [core_rets_calib.rename("core"), sat_rets_calib], axis=1, sort=False
+    ).sort_index()
+    combined = combined.loc[cfg.calib_start:cfg.calib_end].dropna(subset=["core"])
 
     min_obs = max(60, int(0.30 * len(combined)))
     valid = [
@@ -202,6 +279,15 @@ def calibrer_allocation(
         dists = np.abs(candidates[feasible_mask] - w_mid)
         w_opt = float(candidates[feasible_mask][np.argmin(dists)])
     else:
+        if cfg.strict_vol_target:
+            w_best = float(candidates[np.argmin(np.abs(vols - cfg.vol_target_mid))])
+            v_best = portfolio_vol(w_best)
+            raise ValueError(
+                "Vol cible non atteignable dans la plage Core autorisée. "
+                f"Cible [{cfg.vol_target_min:.0%}, {cfg.vol_target_max:.0%}], "
+                f"meilleur point: w_core={w_best:.1%}, vol={v_best:.1%}. "
+                "Élargir l'univers/risque Core ou revoir la construction satellite."
+            )
         w_opt = float(candidates[np.argmin(np.abs(vols - cfg.vol_target_mid))])
         v_at_opt = portfolio_vol(w_opt)
         print(f"  ⚠  Vol cible [{cfg.vol_target_min:.0%}, {cfg.vol_target_max:.0%}] non atteignable "
@@ -241,7 +327,7 @@ def backtest(
 
     dates = cr.index.intersection(sr.index)
     cr = cr.loc[dates]
-    sr = sr.loc[dates].fillna(0.0)
+    sr = sr.loc[dates]
 
     theta = sat_weights.reindex(tickers).fillna(0.0).values   # shape (n,)
     n     = len(tickers)
@@ -258,15 +344,22 @@ def backtest(
     for idx in range(N):
         r_c = float(cr.iloc[idx])
         r_s = sr.iloc[idx].values            # shape (n,)
+        valid = np.isfinite(r_s)
+        r_s_eff = np.where(valid, r_s, 0.0)  # manquants -> pas de mark-to-market
 
         # ── Rendement journalier ──────────────────────────────────────────────
-        port_rets[idx] = w_c * r_c + w_s @ r_s
-        denom = w_s.sum()
-        sat_p_rets[idx] = (w_s / denom) @ r_s if denom > 1e-10 else 0.0
+        if valid.any():
+            w_valid = w_s[valid]
+            denom = w_valid.sum()
+            sat_p_rets[idx] = ((w_valid / denom) @ r_s[valid]) if denom > 1e-10 else 0.0
+            port_rets[idx] = w_c * r_c + (w_valid @ r_s[valid])
+        else:
+            sat_p_rets[idx] = 0.0
+            port_rets[idx] = w_c * r_c
 
         # ── Drift des poids overnight (buy & hold) ────────────────────────────
         w_c_new = w_c * (1.0 + r_c)
-        w_s_new = w_s * (1.0 + r_s)
+        w_s_new = w_s * (1.0 + r_s_eff)
         tot = w_c_new + w_s_new.sum()
         if tot > 1e-10:
             # Preserve the intended gross exposure (possibly > 100%).
@@ -303,12 +396,25 @@ def beta_rolling(y: pd.Series, x: pd.Series, window: int = 63) -> pd.Series:
     return (cov_ / var_).rename("beta_rolling_63j")
 
 
+def _yearly_perf(r: pd.Series) -> pd.Series:
+    """
+    Performance annuelle robuste selon version pandas:
+    - pandas récents : 'YE'
+    - fallback       : 'Y'
+    """
+    try:
+        return (1.0 + r).resample("YE").prod() - 1.0
+    except Exception:
+        return (1.0 + r).resample("Y").prod() - 1.0
+
+
 def calculer_metriques(
     bt_df:       pd.DataFrame,   # output de backtest()
     sat_weights: pd.Series,      # θ optimisés
     fees_bps:    pd.Series,      # frais en bps par ticker
     w_core:      float,
     w_sat:       float,
+    core_fees_bps: float,
     cfg:         FondConfig,
 ) -> Dict:
     """Calcul complet des métriques sur la période de backtest."""
@@ -348,13 +454,13 @@ def calculer_metriques(
     # ── Frais estimés ─────────────────────────────────────────────────────────
     fees_arr        = fees_bps.reindex(sat_weights.index).fillna(cfg.fees_sat_default_bps).values
     fees_sat_wavg   = float(sat_weights.values @ fees_arr)           # bps poche sat
-    fees_total_bps  = w_core * cfg.fees_core_bps + w_sat * fees_sat_wavg
+    fees_total_bps  = w_core * core_fees_bps + w_sat * fees_sat_wavg
 
     # ── Performance annuelle ──────────────────────────────────────────────────
     annual_df = pd.DataFrame({
-        "portfolio": (1.0 + r_p).resample("YE").prod() - 1.0,
-        "core":      (1.0 + r_c).resample("YE").prod() - 1.0,
-        "satellite": (1.0 + r_s).resample("YE").prod() - 1.0,
+        "portfolio": _yearly_perf(r_p),
+        "core":      _yearly_perf(r_c),
+        "satellite": _yearly_perf(r_s),
     })
     annual_df.index = annual_df.index.year
 
@@ -385,7 +491,7 @@ def calculer_metriques(
         "w_core": w_core,
         "w_sat":  w_sat,
         # ── Frais ─────────────────────────────────────────────────────────────
-        "fees_core_contrib_bps":  w_core * cfg.fees_core_bps,
+        "fees_core_contrib_bps":  w_core * core_fees_bps,
         "fees_sat_wavg_bps":      fees_sat_wavg,
         "fees_sat_contrib_bps":   w_sat * fees_sat_wavg,
         "fees_total_bps":         fees_total_bps,
@@ -411,6 +517,7 @@ def main() -> None:
 
     # ── [1] Chargement des données ────────────────────────────────────────────
     print("\n[1] Chargement des données...")
+    core_fees_bps = estimer_frais_core_bps(cfg)
     core_rets = charger_core_rets(cfg)
     print(f"    Core  : {len(core_rets)} obs. | "
           f"{core_rets.index.min().date()} → {core_rets.index.max().date()}")
@@ -423,7 +530,7 @@ def main() -> None:
         sat_info.set_index("ticker")["expense_pct"] * 100.0
     ).fillna(cfg.fees_sat_default_bps)
 
-    sat_prices = charger_prix_satellite(tickers_sat, cfg)
+    sat_prices = charger_prix_satellite(tickers_sat, cfg).sort_index()
     print(f"    Satellite : {sat_prices.shape[1]} fonds | "
           f"{sat_prices.index.min().date()} → {sat_prices.index.max().date()}")
 
@@ -448,10 +555,10 @@ def main() -> None:
         print(f"\n  → Fonds exclus (données insuffisantes sur calib ou backtest) : {excluded}")
 
     # ── [2] Rendements simples satellite ──────────────────────────────────────
-    sat_rets_full  = sat_prices.ffill().pct_change()
+    sat_rets_full  = sat_prices.ffill().pct_change().sort_index()
     # Restreindre à ceux qui ont des données backtest
-    sat_rets_calib = sat_rets_full[tickers_with_backtest].loc[cfg.calib_start:cfg.calib_end]
-    core_calib     = core_rets.loc[cfg.calib_start:cfg.calib_end]
+    sat_rets_calib = sat_rets_full[tickers_with_backtest].loc[cfg.calib_start:cfg.calib_end].sort_index()
+    core_calib     = core_rets.loc[cfg.calib_start:cfg.calib_end].sort_index()
 
     # ── [3] Blocs pour contrainte min-par-bloc ────────────────────────────────
     blocs_dict: Dict[str, List[str]] = {}
@@ -473,16 +580,12 @@ def main() -> None:
         print(f"    {ticker:<30s}  {w:6.1%}   [{bloc_str} – {strat_str}]")
 
     # ── [4] Rendements de la poche satellite sur calib ────────────────────────
+    sat_rets_calib_sel = sat_rets_calib[sat_weights.index]
+    sat_pocket_calib = agreger_ret_satellite(sat_rets_calib_sel, sat_weights)
     aligned_calib = pd.concat(
-        [core_calib.rename("core"),
-         sat_rets_calib[sat_weights.index].fillna(0.0)], axis=1
-    ).dropna(subset=["core"])
-
-    sat_pocket_calib = pd.Series(
-        aligned_calib[sat_weights.index].values @ sat_weights.values,
-        index=aligned_calib.index,
-        name="sat_pocket",
-    )
+        [core_calib.rename("core"), sat_pocket_calib.rename("sat_pocket")], axis=1, sort=False
+    ).sort_index().dropna()
+    sat_pocket_calib = aligned_calib["sat_pocket"]
     core_calib_aligned = aligned_calib["core"]
 
     # Vérification beta + corrélation calib
@@ -523,12 +626,12 @@ def main() -> None:
     # ── [6] Frais estimés ─────────────────────────────────────────────────────
     fees_arr_opt    = fees_bps.reindex(sat_weights.index).fillna(cfg.fees_sat_default_bps).values
     fees_sat_wavg   = float(sat_weights.values @ fees_arr_opt)
-    fees_total_bps  = w_core_eff * cfg.fees_core_bps + w_sat_eff * fees_sat_wavg
+    fees_total_bps  = w_core_eff * core_fees_bps + w_sat_eff * fees_sat_wavg
     fees_ok         = fees_total_bps <= cfg.fees_bps_max
 
     print(f"\n[4] Frais estimés :")
-    print(f"  Core      : {w_core_eff:.1%} × {cfg.fees_core_bps:.0f} bps "
-          f"= {w_core_eff*cfg.fees_core_bps:.1f} bps")
+    print(f"  Core      : {w_core_eff:.1%} × {core_fees_bps:.0f} bps "
+          f"= {w_core_eff*core_fees_bps:.1f} bps")
     print(f"  Satellite : {w_sat_eff:.1%} × {fees_sat_wavg:.0f} bps "
           f"= {w_sat_eff*fees_sat_wavg:.1f} bps")
     print(f"  TOTAL     : {fees_total_bps:.1f} bps (budget {cfg.fees_bps_max:.0f} bps) "
@@ -542,7 +645,9 @@ def main() -> None:
 
     # ── [8] Métriques complètes ───────────────────────────────────────────────
     print("\n[6] Calcul des métriques de performance...")
-    metrics = calculer_metriques(bt_df, sat_weights, fees_bps, w_core_eff, w_sat_eff, cfg)
+    metrics = calculer_metriques(
+        bt_df, sat_weights, fees_bps, w_core_eff, w_sat_eff, core_fees_bps, cfg
+    )
 
     # ── Affichage ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 65)
@@ -606,7 +711,7 @@ def main() -> None:
 
     # Rendements individuels des fonds satellite sur la période OOS
     sat_rets_oos = sat_prices[sat_weights.index].ffill().pct_change()
-    sat_rets_oos = sat_rets_oos.loc[cfg.backtest_start:cfg.backtest_end].fillna(0.0)
+    sat_rets_oos = sat_rets_oos.loc[cfg.backtest_start:cfg.backtest_end]
     sat_rets_oos.to_csv(str(project_root / "outputs" / "satellite_individual_returns.csv"))
     print(f"  -> {project_root / 'outputs' / 'satellite_individual_returns.csv'}")
 
