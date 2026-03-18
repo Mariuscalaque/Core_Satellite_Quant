@@ -96,7 +96,7 @@ def _save(fig_dir: Path, name: str, dpi: int) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(fig_dir / name, dpi=dpi, bbox_inches="tight")
-    plt.show()
+    plt.close("all")    # Ferme la figure pour libérer la mémoire et forcer le rafraîchissement
     print(f"  -> {fig_dir / name}")
 
 BLOC_COLORS = {"Bloc1": "#e6194b", "Bloc2": "#3cb44b", "Bloc3": "#4363d8"}
@@ -181,18 +181,40 @@ def plot_A06_core_annual_bar(annual: pd.DataFrame, cfg: PlotConfig) -> None:
 
 
 def plot_A07_core_fees_bar(core_finaux: pd.DataFrame, cfg: PlotConfig) -> None:
-    """A07 – Frais des ETF Core (expense ratio indicatif)."""
-    # Expense ratios indicatifs DJSC/CBE3/IEAC
-    fee_map = {"DJSC LN Equity": 35, "CBE3 LN Equity": 15, "IEAC LN Equity": 20}
+    """A07 – Frais des ETF Core (expense ratio depuis metadata ou fallback)."""
+    # Lire les TER depuis le nouveau fichier metadata si disponible
+    fee_map: Dict[str, float] = {}
+    meta_excel = project_root / "data" / "univers_core_etf_eur_daily_wide_VF.xlsx"
+    if meta_excel.exists():
+        for sheet in ["Equity", "Rates", "Credit"]:
+            try:
+                df = pd.read_excel(meta_excel, sheet_name=sheet, header=None)
+                headers = df.iloc[4].tolist()
+                data = df.iloc[5:]
+                ticker_idx = ter_idx = None
+                for i, h in enumerate(headers):
+                    hs = str(h).strip().lower() if pd.notna(h) else ""
+                    if "bloomberg" in hs: ticker_idx = i
+                    elif "ter" in hs: ter_idx = i
+                if ticker_idx is not None and ter_idx is not None:
+                    for _, row in data.iterrows():
+                        t = str(row[ticker_idx]).strip() if pd.notna(row[ticker_idx]) else ""
+                        ter = pd.to_numeric(row[ter_idx], errors="coerce")
+                        if t and pd.notna(ter):
+                            # TER en décimal -> bps
+                            fee_map[t] = float(ter * 10000) if ter < 0.1 else float(ter * 100)
+            except Exception:
+                continue
+
     tickers = core_finaux["Ticker"].tolist()
-    fees    = [fee_map.get(t, 25) for t in tickers]
+    fees    = [fee_map.get(t, 25) for t in tickers]  # fallback 25 bps
     themes  = core_finaux["Theme"].tolist()
     fig, ax = plt.subplots(figsize=(7, 4))
-    bars = ax.bar(tickers, fees, color=ETF_COLORS[:len(tickers)])
+    bars = ax.bar(range(len(tickers)), fees, color=ETF_COLORS[:len(tickers)])
     ax.set_ylabel("Expense ratio (bps/an)")
-    ax.set_title("A07 – Frais des ETF Core (expense ratio indicatif)")
+    ax.set_title("A07 – Frais des ETF Core (expense ratio)")
     for bar, v in zip(bars, fees):
-        ax.text(bar.get_x() + bar.get_width() / 2, v + 0.5, f"{v} bps",
+        ax.text(bar.get_x() + bar.get_width() / 2, v + 0.5, f"{v:.0f} bps",
                 ha="center", va="bottom", fontsize=9)
     ax.set_xticks(range(len(tickers)))
     ax.set_xticklabels([f"{t}\n({th})" for t, th in zip(tickers, themes)], fontsize=8)
@@ -518,6 +540,11 @@ def main() -> None:
     cfg = PlotConfig()
     cfg.fig_dir.mkdir(parents=True, exist_ok=True)
 
+    # Forcer le backend non-interactif pour éviter les problèmes d'affichage
+    import matplotlib
+    matplotlib.use("Agg")
+    plt.close("all")  # Nettoyer toute figure résiduelle
+
     print("=" * 60)
     print("  GÉNÉRATION DES GRAPHIQUES – RAPPORT CORE-SATELLITE")
     print("=" * 60)
@@ -573,41 +600,59 @@ def main() -> None:
 
     # ── Section A — Core ────────────────────────────────────────────────────────
     print("\n[2] Section A – Poche Core (7 figures)...")
-    plot_A01_core_etf_cum(log_etf, core_finaux, cfg)
-    plot_A02_core_portfolio_cum(r_core_oos.loc[r_port.index.min():], cfg)
-    plot_A03_core_drawdown(r_core, cfg)
-    plot_A04_core_rolling_vol(r_core, cfg)
-    plot_A05_core_rolling_sharpe(r_core, cfg)
-    plot_A06_core_annual_bar(annual, cfg)
-    plot_A07_core_fees_bar(core_finaux, cfg)
+    try:
+        plot_A01_core_etf_cum(log_etf, core_finaux, cfg)
+        plot_A02_core_portfolio_cum(r_core_oos.loc[r_port.index.min():], cfg)
+        plot_A03_core_drawdown(r_core, cfg)
+        plot_A04_core_rolling_vol(r_core, cfg)
+        plot_A05_core_rolling_sharpe(r_core, cfg)
+        plot_A06_core_annual_bar(annual, cfg)
+        plot_A07_core_fees_bar(core_finaux, cfg)
+    except Exception as e:
+        print(f"  ⚠ Erreur section A : {e}")
+        plt.close("all")
 
     # ── Section B — Satellite ────────────────────────────────────────────────────
     print("\n[3] Section B – Poche Satellite (7 figures)...")
-    plot_B01_sat_fund_cum(sat_indiv, sat_info, sat_weights, cfg)
-    plot_B02_sat_pocket_cum(r_sat, cfg)
-    plot_B03_sat_weights_bar(sat_weights, sat_info, w_sat, cfg)
-    plot_B04_sat_rolling_alpha(r_sat, r_core, cfg)
-    plot_B05_sat_rolling_beta(beta_series, cfg)
-    plot_B06_sat_perf_annual(annual, cfg)
-    plot_B07_sat_fees_bar(sat_weights, sat_info, cfg)
+    try:
+        plot_B01_sat_fund_cum(sat_indiv, sat_info, sat_weights, cfg)
+        plot_B02_sat_pocket_cum(r_sat, cfg)
+        plot_B03_sat_weights_bar(sat_weights, sat_info, w_sat, cfg)
+        plot_B04_sat_rolling_alpha(r_sat, r_core, cfg)
+        plot_B05_sat_rolling_beta(beta_series, cfg)
+        plot_B06_sat_perf_annual(annual, cfg)
+        plot_B07_sat_fees_bar(sat_weights, sat_info, cfg)
+    except Exception as e:
+        print(f"  ⚠ Erreur section B : {e}")
+        plt.close("all")
 
     # ── Section C — Core vs Satellite ────────────────────────────────────────────
     print("\n[4] Section C – Core vs Satellite (4 figures)...")
-    plot_C01_core_vs_sat_cum(r_core, r_sat, r_port, cfg)
-    plot_C02_excess_cum(r_port, r_core, cfg)
-    plot_C04_annual_grouped_bar(annual, cfg)
-    plot_C05_excess_annual_bar(annual, cfg)
+    try:
+        plot_C01_core_vs_sat_cum(r_core, r_sat, r_port, cfg)
+        plot_C02_excess_cum(r_port, r_core, cfg)
+        plot_C04_annual_grouped_bar(annual, cfg)
+        plot_C05_excess_annual_bar(annual, cfg)
+    except Exception as e:
+        print(f"  ⚠ Erreur section C : {e}")
+        plt.close("all")
 
     # ── Section D — Portefeuille total ───────────────────────────────────────────
     print("\n[5] Section D – Portefeuille total (6 figures)...")
-    plot_D01_portfolio_cum(r_port, r_core, cfg)
-    plot_D02_portfolio_drawdown(r_port, r_core, cfg)
-    plot_D03_portfolio_annual_bar(annual, cfg)
-    plot_D04_portfolio_vol_target(r_port, vol_min, vol_max, cfg)
-    plot_D05_beta_sat_rolling(beta_series, cfg)
-    plot_D06_portfolio_dist(r_port, r_core, cfg)
+    try:
+        plot_D01_portfolio_cum(r_port, r_core, cfg)
+        plot_D02_portfolio_drawdown(r_port, r_core, cfg)
+        plot_D03_portfolio_annual_bar(annual, cfg)
+        plot_D04_portfolio_vol_target(r_port, vol_min, vol_max, cfg)
+        plot_D05_beta_sat_rolling(beta_series, cfg)
+        plot_D06_portfolio_dist(r_port, r_core, cfg)
+    except Exception as e:
+        print(f"  ⚠ Erreur section D : {e}")
+        plt.close("all")
 
-    print(f"\n  ✓  24 figures générées dans {cfg.fig_dir}")
+    plt.close("all")
+    n_figs = len(list(cfg.fig_dir.glob("*.png")))
+    print(f"\n  ✓  {n_figs} figures dans {cfg.fig_dir}")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 ,theta_satellite,absolute_weight,w_core,w_sat,portfolio_scale
-BFIST5I LX Equity,0.2,0.05,0.75,0.25,1.0
-SCHTSIC LX Equity,0.2,0.05,0.75,0.25,1.0
-HANGOLD GR Equity,0.2,0.05,0.75,0.25,1.0
-ALBKOCA SW Equity,0.2,0.05,0.75,0.25,1.0
-RLINLRA LN Equity,0.2,0.05,0.75,0.25,1.0
+DWMAEIA ID Equity,0.25,0.0625,0.75,0.25,1.0
+PDAIEUR LX Equity,0.25,0.0625,0.75,0.25,1.0
+EXCRISA LX Equity,0.25,0.0625,0.75,0.25,1.0
+REYLSEB LX Equity,0.25,0.0625,0.75,0.25,1.0

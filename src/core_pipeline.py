@@ -2,7 +2,7 @@
 Pipeline Core – v5 (Excel unifié wide format)
 
 Sources de données :
-  - 'univers_core_etf_eur_daily_wide_VF.xlsx'
+  - 'univers_core_etf_eur_daily_wide.xlsx'
       * Equity / Credit / Rates            : metadata (TER, devise, nom, exposition…)
       * Equity_Wide_Daily_Values            : prix daily wide (dates en lignes, tickers en colonnes)
       * Credit_Wide_Daily_Values            : idem
@@ -36,7 +36,7 @@ class CoreConfig:
     project_root: Path = Path(__file__).resolve().parent.parent
 
     # ── Fichier Excel unifié ───────────────────────
-    core_excel: str = str(project_root / "univers_core_etf_eur_daily_wide_VF.xlsx")
+    core_excel: str = str(project_root /"univers_core_etf_eur_daily_wide_VF.xlsx")
 
     # Onglets prix (format wide : dates en lignes, tickers en colonnes)
     sheet_equity_prices: str = "Equity_Wide_Daily_Values"
@@ -71,6 +71,10 @@ class CoreConfig:
     rebal_freq: int = 63
     w_min: float = 0.05
     w_max: float = 0.50
+    # Floor sur le poids Equity (colonne 0) : empêche l'optimiseur de sous-pondérer
+    # l'Equity en-dessous de ce seuil. Justification : le Core doit garder une
+    # exposition actions structurelle pour capter les primes de risque long terme.
+    equity_weight_floor: float = 0.30
 
     # ── Fenêtres IS / OOS ────────────────────────
     oos_start: str = "2021-01-01"
@@ -338,11 +342,12 @@ def backtest_rolling(
     oos_start: str | None = None,
     oos_end: str | None = None,
     label: str = "OOS",
+    equity_floor: float = 0.0,
 ) -> pd.Series:
     """
     Backtest rolling trimestriel (Max Sharpe contraint).
-    Si oos_start/oos_end sont fournis, ne retient que les rendements dans cette fenêtre.
-    La calibration (lookback) utilise toujours les données précédant chaque rebalancement.
+    Si equity_floor > 0, le poids de la colonne 0 (Equity) est forcé
+    au minimum à cette valeur après optimisation (redistribution pro-rata).
     """
     rets_log = np.log(prices).diff().dropna()
     dates = rets_log.index
@@ -359,6 +364,17 @@ def backtest_rolling(
 
         w = optimiser_max_sharpe_contraint(mu, cov, w_min, w_max)
 
+        # Appliquer le floor Equity si nécessaire
+        if equity_floor > 0 and w[0] < equity_floor:
+            deficit = equity_floor - w[0]
+            w[0] = equity_floor
+            # Redistribuer le déficit pro-rata sur les autres actifs
+            others_sum = w[1:].sum()
+            if others_sum > 1e-12:
+                w[1:] -= deficit * (w[1:] / others_sum)
+            w = np.clip(w, w_min, w_max)
+            w /= w.sum()  # re-normaliser
+
         oos_port = oos.values @ w
         port_log_rets.extend(oos_port.tolist())
         port_dates.extend(oos.index.tolist())
@@ -366,7 +382,6 @@ def backtest_rolling(
     s = pd.Series(port_log_rets, index=pd.DatetimeIndex(port_dates), name=f"core_log_return_{label.lower()}")
     s = s.sort_index()
 
-    # Filtrer sur la fenêtre demandée
     if oos_start:
         s = s.loc[oos_start:]
     if oos_end:
@@ -403,6 +418,7 @@ def main() -> None:
     print(f"  Fichier : {Path(cfg.core_excel).name}")
     print(f"  IS (sélection + calib) : {cfg.score_start} → {cfg.score_end}")
     print(f"  OOS (validation)       : {cfg.oos_start} → {cfg.oos_end}")
+    print(f"  Equity weight floor    : {cfg.equity_weight_floor:.0%}")
     print("=" * 60)
 
     # ── 1) Lecture + filtrage des 3 thèmes ────────────────────────────────
@@ -473,6 +489,7 @@ def main() -> None:
         oos_start=cfg.score_start,
         oos_end=cfg.score_end,
         label="IS",
+        equity_floor=cfg.equity_weight_floor,
     )
     _print_perf_summary(core_log_daily_is, "IS")
 
@@ -490,6 +507,7 @@ def main() -> None:
         oos_start=cfg.oos_start,
         oos_end=cfg.oos_end,
         label="OOS",
+        equity_floor=cfg.equity_weight_floor,
     )
     _print_perf_summary(core_log_daily_oos, "OOS")
 

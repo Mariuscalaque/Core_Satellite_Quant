@@ -77,9 +77,12 @@ class FondConfig:
 
     # ── Fichiers d'entrée ────────────────────────────────────────────────────
     core_daily_csv:       str = str(project_root / "outputs" / "core_returns_daily_oos.csv")
+    core_daily_is_csv:    str = str(project_root / "outputs" / "core_returns_daily_is.csv")
     core_selected_csv:    str = str(project_root / "outputs" / "core_selected_etfs.csv")
-    equity_meta_excel:    str = str(project_root / "data" / "ETF EUR Bloomberg Cross Asset.xlsx")
-    equity_meta_sheet:    str = "Worksheet"
+    core3_etf_log_csv:    str = str(project_root / "outputs" / "core3_etf_daily_log_returns.csv")
+    # Metadata TER Core : nouveau fichier wide format
+    core_meta_excel:      str = str(project_root / "data" / "univers_core_etf_eur_daily_wide_VF.xlsx")
+    core_meta_sheets:     tuple = ("Equity", "Rates", "Credit")
     satellite_selected_csv: str = str(project_root / "outputs" / "satellite_selected.csv")
     price_paths: List[str] = field(default_factory=lambda: [
         str(project_root / "data" / "STRAT1_price.xlsx"),
@@ -100,11 +103,43 @@ class FondConfig:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def charger_core_rets(cfg: FondConfig) -> pd.Series:
-    """Lit les log-rendements journaliers du Core et les convertit en simples."""
-    df = pd.read_csv(cfg.core_daily_csv, index_col=0, parse_dates=True)
-    s = np.exp(df.iloc[:, 0]) - 1.0
-    s.name = "core"
-    return s.sort_index().dropna()
+    """
+    Lit les log-rendements journaliers du Core et les convertit en simples.
+    Charge IS + OOS pour couvrir la calibration ET le backtest.
+    Fallback : reconstruit depuis core3_etf_daily_log_returns.csv (équipondéré).
+    """
+    parts = []
+
+    # 1) Essayer de lire IS
+    is_path = Path(cfg.core_daily_is_csv)
+    if is_path.exists():
+        df_is = pd.read_csv(is_path, index_col=0, parse_dates=True)
+        parts.append(np.exp(df_is.iloc[:, 0]) - 1.0)
+
+    # 2) Lire OOS (toujours disponible)
+    oos_path = Path(cfg.core_daily_csv)
+    if oos_path.exists():
+        df_oos = pd.read_csv(oos_path, index_col=0, parse_dates=True)
+        parts.append(np.exp(df_oos.iloc[:, 0]) - 1.0)
+
+    if parts:
+        s = pd.concat(parts).sort_index()
+        s = s[~s.index.duplicated(keep="first")]
+        s.name = "core"
+        return s.dropna()
+
+    # 3) Fallback : reconstruire depuis les log-rendements des 3 ETFs
+    etf_path = Path(cfg.core3_etf_log_csv)
+    if etf_path.exists():
+        print("  ℹ  Fallback : reconstruction Core depuis core3_etf_daily_log_returns.csv")
+        df_etf = pd.read_csv(etf_path, index_col=0, parse_dates=True).sort_index()
+        # Portefeuille équipondéré simple
+        core_log = df_etf.mean(axis=1)
+        s = (np.exp(core_log) - 1.0).dropna()
+        s.name = "core"
+        return s
+
+    raise FileNotFoundError("Aucun fichier Core (IS, OOS ou ETF log) trouvé.")
 
 
 def charger_prix_satellite(tickers: List[str], cfg: FondConfig) -> pd.DataFrame:
@@ -133,6 +168,8 @@ def charger_prix_satellite(tickers: List[str], cfg: FondConfig) -> pd.DataFrame:
 def estimer_frais_core_bps(cfg: FondConfig) -> float:
     """
     Estime les frais Core (bps/an) à partir des ETF sélectionnés.
+    Lit les metadata TER depuis le nouveau fichier wide
+    (univers_core_etf_eur_daily_wide.xlsx, onglets Equity/Rates/Credit).
     Fallback robuste si metadata incomplet.
     """
     try:
@@ -142,26 +179,46 @@ def estimer_frais_core_bps(cfg: FondConfig) -> float:
         if not tickers:
             return cfg.fees_core_bps
 
-        meta = pd.read_excel(cfg.equity_meta_excel, sheet_name=cfg.equity_meta_sheet)
-        meta["ticker_full"] = meta["Ticker"].astype(str).str.strip() + " Equity"
-        meta["expense_pct"] = (
-            meta["Expense Ratio"]
-            .astype(str)
-            .str.replace("%", "", regex=False)
-            .str.replace(",", ".", regex=False)
-            .pipe(pd.to_numeric, errors="coerce")
-        )
-        exp_map = dict(zip(meta["ticker_full"], meta["expense_pct"]))
+        # Lire metadata TER depuis chaque onglet du nouveau fichier
+        exp_map: Dict[str, float] = {}
+        for sheet in cfg.core_meta_sheets:
+            try:
+                df = pd.read_excel(cfg.core_meta_excel, sheet_name=sheet, header=None)
+                # Header en ligne 4, données à partir de ligne 5
+                headers = df.iloc[4].tolist()
+                data = df.iloc[5:].copy()
+                data.columns = range(len(data.columns))
+
+                # Trouver la colonne ticker (Bloomberg) et TER
+                ticker_idx = None
+                ter_idx = None
+                for i, h in enumerate(headers):
+                    hs = str(h).strip().lower() if pd.notna(h) else ""
+                    if "bloomberg" in hs:
+                        ticker_idx = i
+                    elif "ter" in hs:
+                        ter_idx = i
+
+                if ticker_idx is not None and ter_idx is not None:
+                    for _, row in data.iterrows():
+                        t = str(row[ticker_idx]).strip() if pd.notna(row[ticker_idx]) else ""
+                        ter = pd.to_numeric(row[ter_idx], errors="coerce")
+                        if t and pd.notna(ter) and t not in exp_map:
+                            # TER en décimal (0.002 = 0.2%) → convertir en %
+                            ter_pct = ter * 100.0 if ter < 0.1 else ter
+                            exp_map[t] = ter_pct
+            except Exception:
+                continue
 
         fees_bps = []
         missing = 0
         for t in tickers:
-            exp_pct = exp_map.get(t, np.nan)
-            if pd.isna(exp_pct):
+            ter_pct = exp_map.get(t, np.nan)
+            if pd.isna(ter_pct):
                 missing += 1
                 fees_bps.append(cfg.fees_core_fallback_bps_per_etf)
             else:
-                fees_bps.append(float(exp_pct) * 100.0)  # % -> bps
+                fees_bps.append(float(ter_pct) * 100.0)  # % -> bps
 
         est = float(np.mean(fees_bps))
         if missing:

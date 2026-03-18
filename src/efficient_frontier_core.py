@@ -50,10 +50,11 @@ class FrontierConfig:
     n_sim:       int   = 15_000
     rf:          float = 0.0
     w_min:       float = 0.05
-    w_max:       float = 0.70
+    w_max:       float = 0.50
 
     rolling_lookback: int = 252
     rolling_rebal:    int = 63
+    equity_floor:     float = 0.30   # floor poids Equity (colonne 0), cohérent avec core_pipeline
     dpi:          int   = 160
 
 
@@ -143,8 +144,9 @@ def _backtest_rolling(
     w_min: float, w_max: float,
     lookback: int, rebal: int,
     oos_start: str, oos_end: str,
+    equity_floor: float = 0.0,
 ) -> pd.Series:
-    """Backtest rolling Max Sharpe (comme core_pipeline)."""
+    """Backtest rolling Max Sharpe (cohérent avec core_pipeline, equity floor inclus)."""
     dates = log_rets.index
     port_rets: List[float] = []
     port_dates: List[pd.Timestamp] = []
@@ -154,6 +156,15 @@ def _backtest_rolling(
         mu  = window.mean().values * 252
         cov = window.cov().values  * 252
         w   = _opt_max_sharpe(mu, cov, w_min, w_max)
+        # Appliquer le floor Equity (colonne 0)
+        if equity_floor > 0 and w[0] < equity_floor:
+            deficit = equity_floor - w[0]
+            w[0] = equity_floor
+            others_sum = w[1:].sum()
+            if others_sum > 1e-12:
+                w[1:] -= deficit * (w[1:] / others_sum)
+            w = np.clip(w, w_min, w_max)
+            w /= w.sum()
         r_oos = (np.exp(oos.values) - 1.0) @ w
         port_rets.extend(r_oos.tolist())
         port_dates.extend(oos.index.tolist())
@@ -316,16 +327,18 @@ def main() -> None:
               f"IS Sharpe={s_is:.2f}  OOS Sharpe={m_oos['sharpe']:.2f}")
 
     # ── Max Sharpe Rolling ────────────────────────────────────────────────────
-    print("\n[4] Backtest rolling Max Sharpe (252j lookback, 63j rebal)...")
+    print("\n[4] Backtest rolling Max Sharpe (252j lookback, 63j rebal, equity floor 30%)...")
     roll_ret_is = _backtest_rolling(
         df, cfg.w_min, cfg.w_max,
         cfg.rolling_lookback, cfg.rolling_rebal,
         cfg.calib_start, cfg.calib_end,
+        equity_floor=cfg.equity_floor,
     )
     roll_ret = _backtest_rolling(
         df, cfg.w_min, cfg.w_max,
         cfg.rolling_lookback, cfg.rolling_rebal,
         cfg.oos_start, cfg.oos_end,
+        equity_floor=cfg.equity_floor,
     )
     m_roll_is = _perf_metrics(roll_ret_is)
     m_roll = _perf_metrics(roll_ret)
