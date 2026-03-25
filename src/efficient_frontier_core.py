@@ -32,6 +32,8 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from scipy.optimize import minimize
 
+from src.risk_free import get_bund_risk_free_daily, sharpe_excess
+
 project_root = Path(__file__).resolve().parent.parent
 
 
@@ -55,6 +57,10 @@ class FrontierConfig:
     rolling_lookback: int = 252
     rolling_rebal:    int = 63
     equity_floor:     float = 0.30   # floor poids Equity (colonne 0), cohérent avec core_pipeline
+    equity_ceiling:   float = 0.60   # plafond Equity en régime haussier (tilt momentum)
+    momentum_window:  int   = 252    # fenêtre momentum Equity (jours)
+    momentum_threshold: float = 0.0  # seuil rendement log cumulé pour tilt haussier
+    use_ledoit_wolf:  bool  = True   # Ledoit-Wolf shrinkage si sklearn disponible
     dpi:          int   = 160
 
 
@@ -69,19 +75,29 @@ def _stats_daily(log_rets: pd.DataFrame, weights: np.ndarray) -> Tuple[np.ndarra
     return mu, cov
 
 
-def _port_stats(w: np.ndarray, mu: np.ndarray, cov: np.ndarray) -> Tuple[float, float, float]:
+def _port_stats(
+    w: np.ndarray,
+    mu: np.ndarray,
+    cov: np.ndarray,
+    rf_ann: float = 0.0,
+) -> Tuple[float, float, float]:
     """Rendement, vol, Sharpe annualisés d'un portefeuille."""
     r = float(w @ mu)
     v = float(np.sqrt(w @ cov @ w))
-    s = r / v if v > 1e-10 else np.nan
+    s = (r - rf_ann) / v if v > 1e-10 else np.nan
     return r, v, s
 
 
-def _batch_stats(W: np.ndarray, mu: np.ndarray, cov: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _batch_stats(
+    W: np.ndarray,
+    mu: np.ndarray,
+    cov: np.ndarray,
+    rf_ann: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(ret, vol, sharpe) pour une matrice N×k de poids."""
     rets   = W @ mu
     vols   = np.sqrt(np.einsum("ij,jk,ik->i", W, cov, W))
-    sharpe = np.where(vols > 1e-10, rets / vols, np.nan)
+    sharpe = np.where(vols > 1e-10, (rets - rf_ann) / vols, np.nan)
     return rets, vols, sharpe
 
 
@@ -125,6 +141,32 @@ def _risk_parity(cov: np.ndarray) -> np.ndarray:
     return inv_vol / inv_vol.sum()
 
 
+def _risk_parity_weights(cov: np.ndarray, w_min: float, w_max: float) -> np.ndarray:
+    """
+    Poids Risk Parity (∝ 1/vol individuelle), clipés dans [w_min, w_max].
+    Pas de dépendance à μ → robuste OOS.
+    """
+    vols = np.sqrt(np.diag(cov))
+    inv_vol = 1.0 / (vols + 1e-12)
+    w = inv_vol / inv_vol.sum()
+    w = np.clip(w, w_min, w_max)
+    w /= w.sum()
+    return w
+
+
+def _ledoit_wolf_cov(window_rets: np.ndarray) -> np.ndarray:
+    """
+    Estime la matrice de covariance annualisée par Ledoit-Wolf shrinkage.
+    Fallback vers la covariance empirique si sklearn indisponible.
+    """
+    try:
+        from sklearn.covariance import LedoitWolf
+        lw = LedoitWolf().fit(window_rets)
+        return lw.covariance_ * 252
+    except ImportError:
+        return np.cov(window_rets.T) * 252
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Backtest OOS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -145,18 +187,62 @@ def _backtest_rolling(
     lookback: int, rebal: int,
     oos_start: str, oos_end: str,
     equity_floor: float = 0.0,
+    equity_ceiling: float = 0.0,
+    momentum_window: int = 252,
+    momentum_threshold: float = 0.0,
+    rolling_method: str = "max_sharpe",
+    use_ledoit_wolf: bool = False,
 ) -> pd.Series:
-    """Backtest rolling Max Sharpe (cohérent avec core_pipeline, equity floor inclus)."""
+    """
+    Backtest rolling générique.
+
+    rolling_method :
+      - "max_sharpe"        : Max Sharpe avec μ historique (legacy).
+      - "risk_parity_tilt"  : Risk Parity (1/vol) + tilt Equity momentum.
+      - "min_var"           : Min Variance sous bornes.
+
+    Si use_ledoit_wolf=True, la covariance est estimée par Ledoit-Wolf shrinkage.
+    """
     dates = log_rets.index
     port_rets: List[float] = []
     port_dates: List[pd.Timestamp] = []
     for start in range(lookback, len(dates) - rebal, rebal):
         window = log_rets.iloc[start - lookback:start]
         oos    = log_rets.iloc[start:start + rebal]
-        mu  = window.mean().values * 252
-        cov = window.cov().values  * 252
-        w   = _opt_max_sharpe(mu, cov, w_min, w_max)
-        # Appliquer le floor Equity (colonne 0)
+
+        # ── Estimation de la covariance ───────────────────────────────────
+        if use_ledoit_wolf:
+            cov = _ledoit_wolf_cov(window.values)
+        else:
+            cov = window.cov().values * 252
+
+        # ── Calcul des poids selon la méthode choisie ─────────────────────
+        if rolling_method == "risk_parity_tilt":
+            w = _risk_parity_weights(cov, w_min, w_max)
+            mom_start = max(0, start - momentum_window)
+            equity_rets = log_rets.iloc[mom_start:start].iloc[:, 0]
+            equity_momentum = float(equity_rets.sum())
+            if equity_ceiling > 0 and equity_momentum > momentum_threshold and w[0] < equity_ceiling:
+                tilt_target = equity_ceiling
+                excess = tilt_target - w[0]
+                w[0] = tilt_target
+                others_sum = w[1:].sum()
+                if others_sum > 1e-12:
+                    w[1:] -= excess * (w[1:] / others_sum)
+                w = np.clip(w, w_min, w_max)
+                w /= w.sum()
+        elif rolling_method == "min_var":
+            n = cov.shape[0]
+            w0 = np.ones(n) / n
+            res = minimize(lambda w: w @ cov @ w, w0, method="SLSQP",
+                           bounds=[(w_min, w_max)] * n,
+                           constraints={"type": "eq", "fun": lambda w: w.sum() - 1})
+            w = np.maximum(res.x, 0) / np.maximum(res.x, 0).sum() if res.success else w0
+        else:  # "max_sharpe" (legacy)
+            mu = window.mean().values * 252
+            w  = _opt_max_sharpe(mu, cov, w_min, w_max)
+
+        # ── Appliquer le floor Equity si nécessaire ───────────────────────
         if equity_floor > 0 and w[0] < equity_floor:
             deficit = equity_floor - w[0]
             w[0] = equity_floor
@@ -165,6 +251,7 @@ def _backtest_rolling(
                 w[1:] -= deficit * (w[1:] / others_sum)
             w = np.clip(w, w_min, w_max)
             w /= w.sum()
+
         r_oos = (np.exp(oos.values) - 1.0) @ w
         port_rets.extend(r_oos.tolist())
         port_dates.extend(oos.index.tolist())
@@ -172,12 +259,16 @@ def _backtest_rolling(
     return s.loc[oos_start:oos_end].rename("ret")
 
 
-def _perf_metrics(ret: pd.Series) -> Dict:
+def _perf_metrics(ret: pd.Series, rf_daily: pd.Series | None = None) -> Dict:
     """Métriques annualisées à partir de rendements simples journaliers."""
     n = len(ret)
     ann_ret = float((1 + ret).prod() ** (252 / n) - 1) if n > 0 else np.nan
     ann_vol = float(ret.std() * np.sqrt(252))
-    sharpe  = ann_ret / ann_vol if ann_vol > 1e-10 else np.nan
+    if rf_daily is None:
+        sharpe = ann_ret / ann_vol if ann_vol > 1e-10 else np.nan
+    else:
+        rf_aligned = rf_daily.reindex(ret.index).ffill().fillna(0.0)
+        sharpe = sharpe_excess(ret, rf_aligned)
     cum     = (1 + ret).cumprod()
     mdd     = float(((cum / cum.cummax()) - 1).min())
     return {"ret_ann": ann_ret, "vol_ann": ann_vol, "sharpe": sharpe, "mdd": mdd}
@@ -188,11 +279,12 @@ def _perf_metrics(ret: pd.Series) -> Dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 COLORS = {
-    "Max Sharpe":         "#e6194b",
-    "Min Variance":       "#3cb44b",
-    "Equal Weight":       "#4363d8",
-    "Risk Parity":        "#f58231",
-    "Max Sharpe Rolling": "#911eb4",
+    "Max Sharpe":              "#e6194b",
+    "Min Variance":            "#3cb44b",
+    "Equal Weight":            "#4363d8",
+    "Risk Parity":             "#f58231",
+    "Max Sharpe Rolling":      "#911eb4",
+    "Risk Parity + Tilt":      "#42d4f4",
 }
 
 
@@ -201,21 +293,22 @@ def _plot_frontier(
     strategies: Dict,
     tickers: List[str],
     fig_dir: Path, dpi: int,
+    sharpe_label: str = "Sharpe (IS)",
 ) -> None:
     fig, ax = plt.subplots(figsize=(9, 6))
     sc = ax.scatter(sim_vols, sim_rets, c=sim_sharpe, cmap="viridis",
                     s=5, alpha=0.3, label="_nolegend_")
-    plt.colorbar(sc, ax=ax, label="Sharpe (IS)")
+    plt.colorbar(sc, ax=ax, label=sharpe_label)
 
     markers = {"Max Sharpe": "*", "Min Variance": "D", "Equal Weight": "P",
-               "Risk Parity": "^", "Max Sharpe Rolling": "s"}
+               "Risk Parity": "^", "Max Sharpe Rolling": "s", "Risk Parity + Tilt": "h"}
     for name, d in strategies.items():
         if "w" not in d:
             continue
         w = d["w"]
         ax.scatter(d["vol_is"], d["ret_is"], marker=markers.get(name, "o"),
                    s=160, zorder=5, color=COLORS.get(name, "grey"),
-                   label=f"{name}  Sharpe={d['sharpe_is']:.2f}")
+                   label=f"{name}  Sharpe(exces rf)={d['sharpe_is']:.2f}")
         for i, t in enumerate(tickers):
             ax.annotate(f"{w[i]:.0%}", (d["vol_is"], d["ret_is"]),
                         textcoords="offset points", xytext=(6, -4*(i-1)),
@@ -254,8 +347,8 @@ def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
                    color=[COLORS.get(n, "grey") for n in names])
     ax2.set_xticks(range(len(names)))
     ax2.set_xticklabels(names, rotation=25, ha="right", fontsize=8)
-    ax2.set_title("Sharpe OOS 2021-2025 par stratégie")
-    ax2.set_ylabel("Sharpe")
+    ax2.set_title("Sharpe OOS (exces rf) 2021-2025 par stratégie")
+    ax2.set_ylabel("Sharpe (exces rf)")
     ax2.axhline(0, color="black", lw=0.8)
     for bar, v in zip(bars, sharpes):
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
@@ -290,6 +383,12 @@ def main() -> None:
     print(f"  ETFs : {tickers}")
     print(f"  Période : {df.index.min().date()} → {df.index.max().date()}")
 
+    rf_daily_all, rf_source = get_bund_risk_free_daily(df.index)
+    rf_is = rf_daily_all.reindex(df.loc[cfg.calib_start:cfg.calib_end].index).ffill().fillna(0.0)
+    rf_oos = rf_daily_all.reindex(df.loc[cfg.oos_start:cfg.oos_end].index).ffill().fillna(0.0)
+    rf_ann_is = float(rf_is.mean() * 252) if len(rf_is) else 0.0
+    print(f"  Risk-free Bund : {rf_source}")
+
     # ── Fenêtres ──────────────────────────────────────────────────────────────
     is_df  = df.loc[cfg.calib_start:cfg.calib_end].dropna()
     oos_df = df.loc[cfg.oos_start:cfg.oos_end].dropna()
@@ -300,7 +399,7 @@ def main() -> None:
     # ── Portefeuilles simulés sur IS ──────────────────────────────────────────
     print("\n[2] Simulation de la frontière (IS)...")
     W_sim  = _sim_portfolios(len(tickers), cfg.n_sim)
-    s_rets, s_vols, s_sharpes = _batch_stats(W_sim, mu_is, cov_is)
+    s_rets, s_vols, s_sharpes = _batch_stats(W_sim, mu_is, cov_is, rf_ann=rf_ann_is)
 
     # ── 4 stratégies statiques ────────────────────────────────────────────────
     print("\n[3] Optimisation des 4 stratégies statiques sur IS...")
@@ -308,23 +407,27 @@ def main() -> None:
         "Max Sharpe":    _opt_max_sharpe(mu_is, cov_is, cfg.w_min, cfg.w_max),
         "Min Variance":  _opt_min_var(mu_is, cov_is, cfg.w_min, cfg.w_max),
         "Equal Weight":  np.ones(len(tickers)) / len(tickers),
-        "Risk Parity":   _risk_parity(cov_is),
+        "Risk Parity":   _risk_parity_weights(cov_is, cfg.w_min, cfg.w_max),
     }
 
     strategies: Dict = {}
     for name, w in strat_configs.items():
-        r_is, v_is, s_is = _port_stats(w, mu_is, cov_is)
+        r_is, v_is, s_is = _port_stats(w, mu_is, cov_is, rf_ann=rf_ann_is)
         oos_ret = _backtest_fixed(oos_df, w)
-        m_oos   = _perf_metrics(oos_ret)
+        is_ret = _backtest_fixed(is_df, w)
+        m_is = _perf_metrics(is_ret, rf_is)
+        m_oos   = _perf_metrics(oos_ret, rf_oos)
         strategies[name] = {
             "w":          w,
-            "ret_is":     r_is,  "vol_is": v_is, "sharpe_is": s_is,
+            "ret_is":     m_is["ret_ann"],
+            "vol_is":     m_is["vol_ann"],
+            "sharpe_is":  m_is["sharpe"],
             "oos_ret":    oos_ret,
             "oos_ret_ann": m_oos["ret_ann"], "oos_vol": m_oos["vol_ann"],
             "oos_sharpe":  m_oos["sharpe"],  "oos_mdd": m_oos["mdd"],
         }
         print(f"  {name:<22s}  w=[{', '.join(f'{x:.1%}' for x in w)}]  "
-              f"IS Sharpe={s_is:.2f}  OOS Sharpe={m_oos['sharpe']:.2f}")
+              f"IS Sharpe(exces rf)={m_is['sharpe']:.2f}  OOS Sharpe(exces rf)={m_oos['sharpe']:.2f}")
 
     # ── Max Sharpe Rolling ────────────────────────────────────────────────────
     print("\n[4] Backtest rolling Max Sharpe (252j lookback, 63j rebal, equity floor 30%)...")
@@ -333,15 +436,19 @@ def main() -> None:
         cfg.rolling_lookback, cfg.rolling_rebal,
         cfg.calib_start, cfg.calib_end,
         equity_floor=cfg.equity_floor,
+        rolling_method="max_sharpe",
+        use_ledoit_wolf=False,
     )
     roll_ret = _backtest_rolling(
         df, cfg.w_min, cfg.w_max,
         cfg.rolling_lookback, cfg.rolling_rebal,
         cfg.oos_start, cfg.oos_end,
         equity_floor=cfg.equity_floor,
+        rolling_method="max_sharpe",
+        use_ledoit_wolf=False,
     )
-    m_roll_is = _perf_metrics(roll_ret_is)
-    m_roll = _perf_metrics(roll_ret)
+    m_roll_is = _perf_metrics(roll_ret_is, rf_is)
+    m_roll = _perf_metrics(roll_ret, rf_oos)
     strategies["Max Sharpe Rolling"] = {
         "ret_is":      m_roll_is["ret_ann"],
         "vol_is":      m_roll_is["vol_ann"],
@@ -351,7 +458,44 @@ def main() -> None:
         "oos_sharpe":  m_roll["sharpe"],  "oos_mdd": m_roll["mdd"],
     }
     print(f"  {'Max Sharpe Rolling':<22s}  (rolling)  "
-          f"IS Sharpe={m_roll_is['sharpe']:.2f}  OOS Sharpe={m_roll['sharpe']:.2f}")
+            f"IS Sharpe(exces rf)={m_roll_is['sharpe']:.2f}  OOS Sharpe(exces rf)={m_roll['sharpe']:.2f}")
+
+    # ── Risk Parity + Tilt Rolling ────────────────────────────────────────────
+    print("\n[4b] Backtest rolling Risk Parity + Tilt (Ledoit-Wolf, equity ceiling 60%)...")
+    rp_tilt_ret_is = _backtest_rolling(
+        df, cfg.w_min, cfg.w_max,
+        cfg.rolling_lookback, cfg.rolling_rebal,
+        cfg.calib_start, cfg.calib_end,
+        equity_floor=cfg.equity_floor,
+        equity_ceiling=cfg.equity_ceiling,
+        momentum_window=cfg.momentum_window,
+        momentum_threshold=cfg.momentum_threshold,
+        rolling_method="risk_parity_tilt",
+        use_ledoit_wolf=cfg.use_ledoit_wolf,
+    )
+    rp_tilt_ret = _backtest_rolling(
+        df, cfg.w_min, cfg.w_max,
+        cfg.rolling_lookback, cfg.rolling_rebal,
+        cfg.oos_start, cfg.oos_end,
+        equity_floor=cfg.equity_floor,
+        equity_ceiling=cfg.equity_ceiling,
+        momentum_window=cfg.momentum_window,
+        momentum_threshold=cfg.momentum_threshold,
+        rolling_method="risk_parity_tilt",
+        use_ledoit_wolf=cfg.use_ledoit_wolf,
+    )
+    m_rp_tilt_is = _perf_metrics(rp_tilt_ret_is, rf_is)
+    m_rp_tilt = _perf_metrics(rp_tilt_ret, rf_oos)
+    strategies["Risk Parity + Tilt"] = {
+        "ret_is":      m_rp_tilt_is["ret_ann"],
+        "vol_is":      m_rp_tilt_is["vol_ann"],
+        "sharpe_is":   m_rp_tilt_is["sharpe"],
+        "oos_ret":     rp_tilt_ret,
+        "oos_ret_ann": m_rp_tilt["ret_ann"], "oos_vol": m_rp_tilt["vol_ann"],
+        "oos_sharpe":  m_rp_tilt["sharpe"],  "oos_mdd": m_rp_tilt["mdd"],
+    }
+    print(f"  {'Risk Parity + Tilt':<22s}  (rolling)  "
+            f"IS Sharpe(exces rf)={m_rp_tilt_is['sharpe']:.2f}  OOS Sharpe(exces rf)={m_rp_tilt['sharpe']:.2f}")
 
     # ── Tableau comparatif ────────────────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -383,7 +527,7 @@ def main() -> None:
               f"{row['OOS_vol_ann']:>8.1%} {row['OOS_sharpe']:>7.2f} {row['OOS_mdd']:>8.1%}")
 
     best = comp_df["OOS_sharpe"].idxmax()
-    print(f"\n  ★  Meilleure stratégie OOS (Sharpe) : {best}")
+    print(f"\n  ★  Meilleure stratégie OOS (Sharpe exces rf) : {best}")
 
     # ── Export CSV ────────────────────────────────────────────────────────────
     comp_df.to_csv(cfg.out_csv)
@@ -391,7 +535,16 @@ def main() -> None:
 
     # ── Figures ───────────────────────────────────────────────────────────────
     print("\n[5] Génération des figures...")
-    _plot_frontier(s_rets, s_vols, s_sharpes, strategies, tickers, cfg.fig_dir, cfg.dpi)
+    _plot_frontier(
+        s_rets,
+        s_vols,
+        s_sharpes,
+        strategies,
+        tickers,
+        cfg.fig_dir,
+        cfg.dpi,
+        sharpe_label="Sharpe IS (exces rf Bund)",
+    )
     print(f"  -> {cfg.fig_dir / '06_efficient_frontier_core.png'}")
 
     _plot_oos_perf(strategies, cfg.fig_dir, cfg.dpi)
