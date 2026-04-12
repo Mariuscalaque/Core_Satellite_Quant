@@ -2,7 +2,7 @@
 Comparaison des stratégies Core via frontière efficiente (données daily).
 
 Entrée :
-- data/univers_core_etf_eur_daily_wide.xlsx via src.core_pipeline_corrected.load_selected_core_log_returns
+- data/univers_core_etf_eur_daily_wide.xlsx via src.core_data.load_selected_core_log_returns
 
 Fenêtre IS  : 2019-01-01 → 2020-12-31  (calibration, sans look-ahead)
 Fenêtre OOS : 2021-01-01 → 2025-12-31  (évaluation)
@@ -15,14 +15,15 @@ Stratégies comparées (statiques) :
     5. Efficient Vol X% – portefeuilles efficients sous contrainte de vol cible (10% à 20%)
 
 Sorties :
-- outputs/figures/06_efficient_frontier_core.png    (nuage + stratégies statiques)
-- outputs/figures/07_core_strategies_oos_perf.png   (perfs OOS cumulées)
-- outputs/core_portfolio_comparison.csv             (métriques IS + OOS)
+- outputs/figures/06_efficient_frontier_core.png
+- outputs/figures/07_core_strategies_oos_perf.png
+- outputs/core_portfolio_comparison.csv
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -30,10 +31,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import requests
 from scipy.optimize import minimize
 
-from src.core_pipeline_corrected import load_selected_core_log_returns
-from src.risk_free import get_bund_risk_free_daily
+from src.core_data import load_selected_core_log_returns
 
 project_root = Path(__file__).resolve().parent.parent
 
@@ -57,6 +58,54 @@ class FrontierConfig:
 
     target_vols: Tuple[float, ...] = tuple(np.round(np.arange(0.10, 0.201, 0.01), 2))
     dpi:          int   = 160
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Risk-free rate (ex risk_free.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _annual_yield_to_daily_return(y_ann: pd.Series) -> pd.Series:
+    y_ann = pd.to_numeric(y_ann, errors="coerce")
+    return (1.0 + y_ann).pow(1.0 / 252.0) - 1.0
+
+
+def get_bund_risk_free_daily(
+    index: pd.DatetimeIndex,
+    default_annual: float = 0.02,
+    timeout_sec: float = 4.0,
+) -> Tuple[pd.Series, str]:
+    """
+    Daily risk-free series aligned to *index*.
+
+    Priority : FRED CSV (Germany 10Y) → constant fallback.
+    """
+    src = {
+        "name": "FRED IRLTLT01DEM156N",
+        "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=IRLTLT01DEM156N",
+        "date_col": "DATE",
+        "value_col": "IRLTLT01DEM156N",
+        "is_percent": True,
+    }
+    try:
+        response = requests.get(src["url"], timeout=timeout_sec)
+        response.raise_for_status()
+        raw = pd.read_csv(StringIO(response.text))
+        if src["date_col"] in raw.columns and src["value_col"] in raw.columns:
+            s = raw[[src["date_col"], src["value_col"]]].copy()
+            s[src["date_col"]] = pd.to_datetime(s[src["date_col"]], errors="coerce")
+            s = s.dropna(subset=[src["date_col"]]).set_index(src["date_col"]).sort_index()
+            y = pd.to_numeric(s[src["value_col"]], errors="coerce")
+            if src["is_percent"]:
+                y = y / 100.0
+            rf_daily = _annual_yield_to_daily_return(y).rename("risk_free")
+            rf_daily = rf_daily.reindex(index).ffill().fillna(0.0)
+            return rf_daily, f"API {src['name']}"
+    except Exception:
+        pass
+
+    daily = (1.0 + default_annual) ** (1.0 / 252.0) - 1.0
+    rf_daily = pd.Series(daily, index=index, name="risk_free")
+    return rf_daily, f"Fallback constant {default_annual:.2%} annual"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -254,13 +303,6 @@ def _opt_target_vol(mu: np.ndarray, cov: np.ndarray, w_min: float, w_max: float,
     return w / w.sum() if w.sum() > 1e-12 else _opt_min_var(mu, cov, w_min, w_max)
 
 
-def _risk_parity(cov: np.ndarray) -> np.ndarray:
-    """Poids inversement proportionnels à la vol individuelle."""
-    vols = np.sqrt(np.diag(cov))
-    inv_vol = 1.0 / (vols + 1e-12)
-    return inv_vol / inv_vol.sum()
-
-
 def _risk_parity_weights(cov: np.ndarray, w_min: float, w_max: float) -> np.ndarray:
     """
     Poids Risk Parity (∝ 1/vol individuelle), clipés dans [w_min, w_max].
@@ -440,6 +482,7 @@ def _plot_frontier(
     target_vols: Tuple[float, ...],
     fig_dir: Path, dpi: int,
     sharpe_label: str = "Sharpe (IS)",
+    is_label: str = "IS",
 ) -> None:
     fig, ax = plt.subplots(figsize=(9, 6))
     sc = ax.scatter(sim_vols, sim_rets, c=sim_sharpe, cmap="viridis",
@@ -464,15 +507,15 @@ def _plot_frontier(
                         textcoords="offset points", xytext=(6, -4*(i-1)),
                         fontsize=7, color=colors.get(name, "grey"))
 
-    ax.set_xlabel("Volatilité annualisée (IS 2019-2020)")
-    ax.set_ylabel("Rendement annualisé (IS 2019-2020)")
-    ax.set_title("Frontière efficiente – 3 ETF Core\n(calibration 2019-2020, daily)")
+    ax.set_xlabel(f"Volatilité annualisée ({is_label})")
+    ax.set_ylabel(f"Rendement annualisé ({is_label})")
+    ax.set_title(f"Frontière efficiente – 3 ETF Core\n(calibration {is_label}, daily)")
     ax.legend(fontsize=8)
     plt.tight_layout()
     return fig
 
 
-def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
+def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int, oos_label: str = "OOS") -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     # ── Cumulative OOS ────────────────────────────────────────────────────────
@@ -482,7 +525,7 @@ def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
             continue
         cum = 100 * (1 + d["oos_ret"]).cumprod()
         ax.plot(cum.index, cum.values, label=name, color=COLORS.get(name, "grey"))
-    ax.set_title("Performance cumulée OOS 2021-2025 (base 100)")
+    ax.set_title(f"Performance cumulée {oos_label} (base 100)")
     ax.set_xlabel("Date")
     ax.set_ylabel("Valeur (base 100)")
     ax.legend(fontsize=8)
@@ -496,7 +539,7 @@ def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
                    color=[COLORS.get(n, "grey") for n in names])
     ax2.set_xticks(range(len(names)))
     ax2.set_xticklabels(names, rotation=25, ha="right", fontsize=8)
-    ax2.set_title("Sharpe OOS (exces rf) 2021-2025 par stratégie")
+    ax2.set_title(f"Sharpe OOS (exces rf) {oos_label} par stratégie")
     ax2.set_ylabel("Sharpe (exces rf)")
     ax2.axhline(0, color="black", lw=0.8)
     for bar, v in zip(bars, sharpes):
@@ -544,7 +587,7 @@ def _weights_selection_dataframe(
     
     # Formater en pourcentage
     weights_df = weights_df.multiply(100).round(2)
-    weights_df = weights_df.applymap(lambda x: f"{x:.2f}%")
+    weights_df = weights_df.map(lambda x: f"{x:.2f}%")
     
     if output_csv:
         weights_df.to_csv(output_csv)
@@ -556,9 +599,36 @@ def _weights_selection_dataframe(
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main() -> Tuple[Dict, pd.DataFrame]:
+def main(
+    core_equity: str | None = None,
+    core_rates: str | None = None,
+    core_credit: str | None = None,
+    calib_start: str | None = None,
+    calib_end: str | None = None,
+    oos_start: str | None = None,
+    oos_end: str | None = None,
+) -> Tuple[Dict, pd.DataFrame]:
     cfg = FrontierConfig()
     cfg.fig_dir.mkdir(parents=True, exist_ok=True)
+
+    # Override dates if provided
+    if calib_start is not None:
+        object.__setattr__(cfg, 'calib_start', calib_start)
+    if calib_end is not None:
+        object.__setattr__(cfg, 'calib_end', calib_end)
+    if oos_start is not None:
+        object.__setattr__(cfg, 'oos_start', oos_start)
+    if oos_end is not None:
+        object.__setattr__(cfg, 'oos_end', oos_end)
+
+    # Override tickers in CoreConfig if provided by caller
+    from src.core_data import CoreConfig as _CoreConfig
+    _base = _CoreConfig()
+    core_cfg = _CoreConfig(
+        selected_equity=core_equity if core_equity is not None else _base.selected_equity,
+        selected_rates=core_rates if core_rates is not None else _base.selected_rates,
+        selected_credit=core_credit if core_credit is not None else _base.selected_credit,
+    )
 
     print("=" * 60)
     print("  COMPARAISON DES STRATÉGIES CORE (Markowitz daily)")
@@ -568,7 +638,7 @@ def main() -> Tuple[Dict, pd.DataFrame]:
 
     # ── Chargement ────────────────────────────────────────────────────────────
     print("\n[1] Chargement des log-rendements journaliers des 3 ETF depuis l'Excel source...")
-    df = load_selected_core_log_returns(verbose=False)
+    df = load_selected_core_log_returns(cfg=core_cfg, verbose=False)
     df = df.sort_index()
     tickers = list(df.columns)
     print(f"  ETFs : {tickers}")
@@ -667,6 +737,8 @@ def main() -> Tuple[Dict, pd.DataFrame]:
 
     # ── Figures ───────────────────────────────────────────────────────────────
     print("\n[5] Génération des figures...")
+    _is_lbl = f"IS {cfg.calib_start[:4]}-{cfg.calib_end[:4]}"
+    _oos_lbl = f"OOS {cfg.oos_start[:4]}-{cfg.oos_end[:4]}"
     fig_frontier = _plot_frontier(
         s_rets,
         s_vols,
@@ -677,8 +749,9 @@ def main() -> Tuple[Dict, pd.DataFrame]:
         cfg.fig_dir,
         cfg.dpi,
         sharpe_label="Sharpe IS (exces rf Bund)",
+        is_label=_is_lbl,
     )
-    fig_oos = _plot_oos_perf(strategies, cfg.fig_dir, cfg.dpi)
+    fig_oos = _plot_oos_perf(strategies, cfg.fig_dir, cfg.dpi, oos_label=_oos_lbl)
 
     print("\n  ✓  Frontière efficiente terminée.")
     return strategies, comp_df, fig_frontier, fig_oos
